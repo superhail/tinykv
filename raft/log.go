@@ -14,7 +14,14 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
+
+// return if cannot find index in entries
+var ErrCannotFindIndex = errors.New("cannot find index")
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -55,8 +62,17 @@ type RaftLog struct {
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	// Your Code Here (2A).
-	return nil
+	var raftLog *RaftLog
+	if lastIndex, err := storage.LastIndex(); err == nil {
+		raftLog = &RaftLog{
+			storage: storage,
+			committed: lastIndex,
+			applied: lastIndex,
+			stabled: lastIndex,
+			entries: make([]pb.Entry, 0),
+		}
+	}
+	return raftLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -66,26 +82,57 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
+// get the position of smallest entry which satisfies entry.index > index
+func (l *RaftLog) entryAfter(index uint64) int {
+	var left int = 0
+	var right int = len(l.entries) - 1
+	for left < right {
+		var mid int = (left + right) / 2
+		if (l.entries[mid].Index <= l.stabled) {
+			left = mid + 1
+		} else {
+			right = mid
+		}
+	}
+	return left
+}
+
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	return l.entries[l.entryAfter(l.stabled):]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	return l.entries[l.entryAfter(l.applied):l.entryAfter(l.committed)]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return 0
+	if (len(l.entries) == 0) {
+		return 0
+	} else {
+		return l.entries[len(l.entries) - 1].Index
+	}
 }
 
 // Term return the term of the entry in the given index
+// return err if not found
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	var position int = l.entryAfter(i) - 1
+	if (position >= 0 && l.entries[position].Index == i) {
+		return l.entries[position].Term, nil
+	}
+	return 0, ErrCannotFindIndex
+}
+
+// remove all entries after i and i iteself
+func (l *RaftLog) RemoveAfter(i uint64) {
+	var position = l.entryAfter(i) - 1
+	if (position == -1) {
+		position = 0
+	}
+	l.entries = l.entries[position:]
+
+	return
 }
