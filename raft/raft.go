@@ -294,10 +294,9 @@ func (r *Raft) tick() {
 		}
 	}
 	r.electionElapsed++
-	if (r.electionElapsed >= r.electionElapsed) {
-		if (r.State == StateFollower || r.State == StateCandidate) {
-			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgHup})
-		}
+	if (r.electionElapsed >= r.electionTimeout) {
+		r.becomeCandidate()
+		r.requestVotes()
 	}
 }
 
@@ -319,24 +318,8 @@ func (r *Raft) becomeCandidate() {
 	for k := range r.votes {
 		r.votes[k] = false
 	}
+	r.handleRequestVoteResponse(pb.Message{From: r.id, To: r.id, Term: r.Term, Reject: false})
 	r.electionElapsed = 0
-	r.msgs = append(r.msgs, pb.Message{
-		MsgType: pb.MessageType_MsgHup,
-	})	
-	// get last log term
-	prevLogIndex := r.RaftLog.stabled
-	var lastLogTerm uint64 = 0
-	var err error = nil
-	if (prevLogIndex != 0) {
-		lastLogTerm, err = r.RaftLog.Term(prevLogIndex)
-	}
-	if (err != nil) {
-		log.Panicf("becomeCandidate(): find term for index %d error %v", prevLogIndex, err)
-	}
-
-	for peerID := range r.Prs {
-		r.sendRequestVote(peerID, lastLogTerm, prevLogIndex)
-	}
 }
 
 // becomeLeader transform this peer's state to leader
@@ -362,13 +345,18 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgRequestVote:
 			r.handleRequestVote(m)
 			break
+		case pb.MessageType_MsgHup:
+			r.handleMsgHup(m)
+			break
+		case pb.MessageType_MsgAppendResponse:
+		case pb.MessageType_MsgRequestVoteResponse:
+		case pb.MessageType_MsgHeartbeatResponse:
+			break
 		default:
+			log.Panicf("unrecognized message state:%v msg:%v \n", r.State.String(), m.String())
 		}
 	case StateCandidate:
 		switch m.MsgType {
-		case pb.MessageType_MsgRequestVoteResponse:
-			r.handleRequestVoteResponse(m)
-			break
 		case pb.MessageType_MsgAppend:
 			if (m.Term > r.Term) { // if greater than current term, then we should become follower
 				r.becomeFollower(m.Term, m.From)
@@ -381,7 +369,20 @@ func (r *Raft) Step(m pb.Message) error {
 				r.handleHeartbeat(m)
 			}
 			break
+		case pb.MessageType_MsgRequestVote:
+			r.handleRequestVote(m)
+			break
+		case pb.MessageType_MsgHup:
+			r.handleMsgHup(m)
+			break
+		case pb.MessageType_MsgRequestVoteResponse:
+			r.handleRequestVoteResponse(m)
+			break
+		case pb.MessageType_MsgAppendResponse:
+		case pb.MessageType_MsgHeartbeatResponse:
+			break
 		default:
+			log.Panicf("unrecognized message state:%v msg:%v \n", r.State.String(), m.String())
 		}
 	case StateLeader:
 		switch m.MsgType {
@@ -400,16 +401,22 @@ func (r *Raft) Step(m pb.Message) error {
 				r.handleHeartbeat(m)
 			}
 			break
+		case pb.MessageType_MsgRequestVote:
+			r.handleRequestVote(m)
+			break
 		case pb.MessageType_MsgAppendResponse:
 			r.handleAppendEntriesResponse(m)
 			break
 		case pb.MessageType_MsgHeartbeatResponse:
 			r.handleHeartbeatReponse(m)
 			break
-		case pb.MessageType_MsgRequestVote:
-			r.handleRequestVote(m)
+		case pb.MessageType_MsgHup:
+			r.handleMsgHup(m)
+			break
+		case pb.MessageType_MsgRequestVoteResponse:
 			break
 		default:
+			log.Panicf("unrecognized message state:%v msg:%v \n", r.State.String(), m.String())
 		}
 	}
 	return nil
@@ -420,7 +427,7 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// reply false if term < currentTerm
 	if (m.Term < r.Term) {
-		r.sendAppendEntriesResponse(m.From, false)
+		r.sendAppendEntriesResponse(m.From, true)
 		return
 	} else if (m.Term > r.Term) {
 		r.Term = m.Term
@@ -433,7 +440,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		term, err = r.RaftLog.Term(m.Index)
 	}
 	if (err != nil || term != m.LogTerm) {
-		r.sendAppendEntriesResponse(m.From, false)
+		r.sendAppendEntriesResponse(m.From, true)
 		return
 	}
 	// if find a mismatched entry, delete all entries after mismatched entries
@@ -446,14 +453,15 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			r.RaftLog.committed = min(m.Commit, entry.Index) // update committed
 		}
 	}
-	r.sendAppendEntriesResponse(m.From, true)
+	r.sendAppendEntriesResponse(m.From, false)
+	r.electionElapsed = 0
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// reply false if term < currentTerm
 	if (m.Term < r.Term) {
-		r.sendHeartbeatResponse(m.From, false)
+		r.sendHeartbeatResponse(m.From, true)
 		return
 	} else if (m.Term > r.Term) {
 		r.Term = m.Term
@@ -466,10 +474,10 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		term, err = r.RaftLog.Term(m.Index)
 	}
 	if (err != nil || term != m.LogTerm) {
-		r.sendHeartbeatResponse(m.From, false)
+		r.sendHeartbeatResponse(m.From, true)
 		return
 	}
-	r.sendHeartbeatResponse(m.From, true)
+	r.sendHeartbeatResponse(m.From, false)
 	r.electionElapsed = 0
 }
 
@@ -489,7 +497,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 func (r *Raft) handleHeartbeatReponse(m pb.Message) {}
 
 func (r *Raft) handleRequestVote(m pb.Message) {
-	if (m.Term < r.Term || r.Vote == None) {
+	if (m.Term < r.Term) {
 		r.sendRequestVoteResponse(m.From, false)
 	} else {
 		lastLogIndex := r.RaftLog.stabled
@@ -503,32 +511,31 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		}
 		// candidate is null and candidate'log is at least 
 		// as up-to-date as receiver's log, grant vote
-		if (m.LogTerm > lastLogTerm || (m.LogTerm == lastLogTerm && m.Index >= lastLogIndex)) {
-			r.sendAppendEntriesResponse(m.From, true)
+		if (r.Vote == None && (m.LogTerm > lastLogTerm || (m.LogTerm == lastLogTerm && m.Index >= lastLogIndex))) {
+			r.sendRequestVoteResponse(m.From, true)
 		} else {
-			r.sendAppendEntriesResponse(m.From, false)
+			r.sendRequestVoteResponse(m.From, r.Vote == m.From)
 		}
 	}
 }
 
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
+	if (m.Term != r.Term) { // neglect outdated responses
+		return
+	}
 	if _, ok := r.Prs[m.From]; ok {
-		if (!m.Reject) {
-			r.votes[m.From] = true
-		} else {
-			r.votes[m.From] = false
-		}
+		r.votes[m.From] = !m.Reject
 	} else {
 		log.Printf("cannot find peer id %d", m.From)
 	}
-	if (len(r.votes) == len(r.Prs)) {
-		var granted_cnt int = 0
+	if (len(r.votes) * 2 >= len(r.Prs)) {
+		var grantedCnt int = 0
 		for _, v := range r.votes {
 			if v {
-				granted_cnt++
+				grantedCnt++
 			}
 		}
-		if (granted_cnt * 2 > len(r.Prs)) { // wins election
+		if (grantedCnt * 2 > len(r.Prs)) { // wins election
 			r.becomeLeader()
 		}
 	}
@@ -549,9 +556,34 @@ func (r *Raft) handlePropose(m pb.Message) {
 	}
 }
 
+func (r *Raft) handleMsgHup(m pb.Message) {
+	r.becomeCandidate()
+	r.requestVotes()
+}
+
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+}
+
+// send request vote requests to all peers other than self
+func (r *Raft) requestVotes() {
+	// get last log term
+	prevLogIndex := r.RaftLog.stabled
+	var lastLogTerm uint64 = 0
+	var err error = nil
+	if (prevLogIndex != 0) {
+		lastLogTerm, err = r.RaftLog.Term(prevLogIndex)
+	}
+	if (err != nil) {
+		log.Panicf("becomeCandidate(): find term for index %d error %v", prevLogIndex, err)
+	}
+
+	for peerID := range r.Prs {
+		if (peerID != r.id) {
+			r.sendRequestVote(peerID, lastLogTerm, prevLogIndex)
+		}
+	}	
 }
 
 // addNode add a new node to raft group
