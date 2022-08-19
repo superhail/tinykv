@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"log"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -63,14 +64,22 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	var raftLog *RaftLog
-	if lastIndex, err := storage.LastIndex(); err == nil {
-		raftLog = &RaftLog{
-			storage: storage,
-			committed: lastIndex,
-			applied: lastIndex,
-			stabled: lastIndex,
-			entries: make([]pb.Entry, 0),
-		}
+	firstIndex, err := storage.FirstIndex()
+	if (err != nil) {
+		log.Panicf("%v", err)
+	}
+	lastIndex, err := storage.LastIndex()
+	if (err != nil) {
+		log.Panicf("%v", err)
+	}
+	entries, err := storage.Entries(firstIndex, lastIndex + 1)
+	if (err != nil) {
+		log.Panicf("%v", err)
+	}
+	raftLog = &RaftLog{
+		storage: storage,
+		entries: entries,
+		stabled: lastIndex,
 	}
 	return raftLog
 }
@@ -83,12 +92,12 @@ func (l *RaftLog) maybeCompact() {
 }
 
 // get the position of smallest entry which satisfies entry.index > index
-func (l *RaftLog) entryAfter(index uint64) int {
+func (l *RaftLog) idxAfter(index uint64) int {
 	var left int = 0
-	var right int = len(l.entries) - 1
+	var right int = len(l.entries)
 	for left < right {
 		var mid int = (left + right) / 2
-		if (l.entries[mid].Index <= l.stabled) {
+		if (l.entries[mid].Index <= index) {
 			left = mid + 1
 		} else {
 			right = mid
@@ -99,18 +108,42 @@ func (l *RaftLog) entryAfter(index uint64) int {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	return l.entries[l.entryAfter(l.stabled):]
+	return l.entries[l.idxAfter(l.stabled):]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	return l.entries[l.entryAfter(l.applied):l.entryAfter(l.committed)]
+	firstIndex, err := l.storage.FirstIndex()
+	if (err != nil) {
+		log.Printf("%v\n", err)
+		firstIndex = 0
+	}
+	lastIndex, err := l.storage.LastIndex()
+	if (err != nil) {
+		log.Printf("%v\n", err)
+		lastIndex = firstIndex
+	}
+	var entries []pb.Entry = make([]pb.Entry, 0)
+	if (firstIndex >= 1 && lastIndex >= firstIndex) {
+		entries, err = l.storage.Entries(max(l.applied + 1, firstIndex) , min(lastIndex, l.committed) + 1)
+		if (err != nil) {
+			log.Panicf("%v l.applied:%d l.committed:%d\n", err, l.applied, l.committed)
+		}
+		entries = append(entries, l.entries[l.idxAfter(min(lastIndex, l.committed)):l.idxAfter(l.committed)]...)
+	} else {
+		entries = append(entries, l.entries[l.idxAfter(l.applied):l.idxAfter(l.committed)]...)
+	}
+	return entries
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	if (len(l.entries) == 0) {
-		return 0
+		lastIndex, err := l.storage.LastIndex()
+		if (err != nil) {
+			log.Panicf("RaftLog.LastIndex() error\n")
+		}
+		return lastIndex
 	} else {
 		return l.entries[len(l.entries) - 1].Index
 	}
@@ -119,20 +152,25 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 // return err if not found
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	var position int = l.entryAfter(i) - 1
-	if (position >= 0 && l.entries[position].Index == i) {
-		return l.entries[position].Term, nil
+	if (i <= l.stabled) {
+		return l.storage.Term(i)
+	} else {
+		var position int = l.idxAfter(i) - 1
+		if (position >= 0 && l.entries[position].Index == i) {
+			return l.entries[position].Term, nil
+		}
+		return 0, ErrCannotFindIndex
 	}
-	return 0, ErrCannotFindIndex
 }
 
 // remove all entries after i and i iteself
 func (l *RaftLog) RemoveAfter(i uint64) {
-	var position = l.entryAfter(i) - 1
-	if (position == -1) {
-		position = 0
+	var position = l.idxAfter(i) - 1
+	if (position != -1) {
+		l.entries = l.entries[:position]
 	}
-	l.entries = l.entries[position:]
-
+	if (l.stabled >= i) {
+		l.stabled = i - 1
+	}
 	return
 }
