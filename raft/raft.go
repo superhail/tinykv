@@ -327,7 +327,7 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = None
 	r.Vote = r.id
 	r.votes = make(map[uint64]bool)
-	r.handleRequestVoteResponse(pb.Message{From: r.id, To: r.id, Term: r.Term, Reject: false})
+	// r.handleRequestVoteResponse(pb.Message{From: r.id, To: r.id, Term: r.Term, Reject: false})
 	r.electionElapsed = 0
 	r.electionTimeout = r.baseLineElectionTimeout + rand.Intn(r.baseLineElectionTimeout)
 }
@@ -342,23 +342,24 @@ func (r *Raft) becomeLeader() {
 		progress.Match = 0						// matchIndex is initialised to 0
 		progress.Next = r.RaftLog.LastIndex() + 1	// next is initialised to the index just after the last one in its log
 	}
-	r.Prs[r.id].Match = r.Prs[r.id].Next
 	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
 			EntryType: pb.EntryType_EntryNormal, 
 			Term: r.Term, 
 			Index: r.Prs[r.id].Next, 
 			Data: nil})
-	r.Prs[r.id].Next++
 	r.handleAppendEntriesResponse(pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse, 
 		To: r.id, 
 		From: r.id, 
+		Index: r.Prs[r.id].Next,
 		Entries: []*pb.Entry{{
 				EntryType: pb.EntryType_EntryNormal, 
 				Term: r.Term, 
 				Index: r.Prs[r.id].Next,
 				Data: nil,
 			}}})
+	r.Prs[r.id].Match = r.Prs[r.id].Next
+	r.Prs[r.id].Next++
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -537,6 +538,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	r.electionElapsed = 0
 }
 
+// if message is rejected, then we will send Append agian with lower Index.
+// if message is not rejected, then we will update committed if necessary(if more than half agreed upon this message).
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	if progress, ok := r.Prs[m.From]; ok {
 		if (m.Reject) {
@@ -546,7 +549,8 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			if (progress.Match < m.Index) {
 				progress.Match = m.Index
 				term, _ := r.RaftLog.Term(m.Index)
-				if (term == r.Term) { // test if can be new committed
+				// test if can be new committed, leader will only commit entries of current term
+				if (term == r.Term) {
 					var cnt int = 0
 					for _, p := range r.Prs {
 						if (p.Match >= progress.Match) {
@@ -692,6 +696,8 @@ func (r *Raft) requestVotes() {
 	for peerID := range r.Prs {
 		if (peerID != r.id) {
 			r.sendRequestVote(peerID, lastLogTerm, prevLogIndex)
+		} else {
+			r.handleRequestVoteResponse(pb.Message{From: r.id, To: r.id, Term: r.Term, Reject: false})
 		}
 	}	
 }
